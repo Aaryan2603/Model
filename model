@@ -1,0 +1,213 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score
+
+def load_and_process_data(filepath):
+    """
+    Loads and preprocesses the dataset.
+    - Reads CSV data from filepath.
+    - Creates a ProductName from the 'title' column.
+    - Creates a Season column from 'theme' (default to "Summer").
+    - Uses 'units_sold' as PreviousSales.
+    - Defines a binary target (1 if PreviousSales > 50, else 0).
+    - Normalizes PreviousSales.
+    - One-hot encodes Season.
+    - Ensures a unique ProductID.
+
+    Returns:
+    data (DataFrame): The full preprocessed data.
+    X (ndarray): Feature matrix.
+    y (ndarray): Target array.
+    product_ids (ndarray): Array of ProductIDs.
+    product_names (ndarray): Array of product names.
+    """
+    data = pd.read_csv(filepath)
+    print("Data loaded successfully.")
+    print(data.head())
+
+    # Use the 'title' column as the product name
+    data['ProductName'] = data['title']
+
+    # Create a Season column from the 'theme' column (default to "Summer")
+    if 'theme' in data.columns:
+        data['Season'] = data['theme']
+    else:
+        data['Season'] = "Summer"
+
+    # Use 'units_sold' as the measure of previous sales
+    data['PreviousSales'] = data['units_sold']
+
+    # Create a binary target: 1 if PreviousSales > 50, else 0
+    data['Target'] = (data['PreviousSales'] > 50).astype(int)
+
+    # Normalize PreviousSales (for use as a feature)
+    data['PreviousSalesNorm'] = data['PreviousSales'] / data['PreviousSales'].max()
+
+    # One-hot encode the Season column
+    season_dummies = pd.get_dummies(data['Season'], prefix='Season')
+
+    # Ensure a ProductID column exists; if not, use 'product_id' or create one from index
+    if 'ProductID' not in data.columns:
+        if 'product_id' in data.columns:
+            data['ProductID'] = data['product_id']
+        else:
+            data['ProductID'] = data.index + 1
+
+    # Combine normalized previous sales and season dummies into the feature matrix
+    data_processed = pd.concat([data[['ProductID', 'PreviousSalesNorm']], season_dummies], axis=1)
+    X = data_processed.drop('ProductID', axis=1).values
+    y = data['Target'].values
+    product_ids = data['ProductID'].values
+    product_names = data['ProductName'].values
+
+    return data, X, y, product_ids, product_names
+
+
+def train_models(X, y, product_ids):
+    """
+    Splits data into training and test sets and trains:
+    - A Random Forest classifier with Bayesian hyperparameter optimization.
+    - A gradient descent-based classifier (SGDClassifier with logistic loss).
+
+    Returns:
+    rf_best: Trained Random Forest classifier after optimization.
+    sgd: Trained SGDClassifier (or None if error occurs).
+    X_test: Test features.
+    y_test: Test targets.
+    product_ids_test: Test ProductIDs.
+    """
+    X_train, X_test, y_train, y_test, product_ids_train, product_ids_test = train_test_split(
+        X, y, product_ids, test_size=0.2, random_state=42)
+
+    # Define hyperparameter search space for Random Forest
+    param_space = {
+        'n_estimators': (10, 200),
+        'max_depth': (2, 20),
+        'min_samples_split': (2, 20),
+        'min_samples_leaf': (1, 20),
+        'max_features': ['sqrt', 'log2', None]
+    }
+
+    # Initialize Random Forest classifier (without fixed params)
+    rf = RandomForestClassifier(random_state=42)
+
+    # Set up Bayesian Optimization with cross-validation
+    opt = BayesSearchCV(
+        rf,
+        param_space,
+        n_iter=20,  # Increase iterations for better search
+        cv=32,
+        n_jobs=-1,
+        random_state=42,
+        scoring='accuracy',
+        verbose=0
+    )
+
+    # Fit Bayesian optimization only on training data
+    opt.fit(X_train, y_train)
+
+    # Best estimator after optimization
+    rf_best = opt.best_estimator_
+
+    # Predict on test set and evaluate
+    rf_pred = rf_best.predict(X_test)
+    rf_acc = accuracy_score(y_test, rf_pred)
+
+    # Train Gradient Descent model (SGDClassifier with logistic loss)
+    try:
+        sgd = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3, random_state=42)
+        sgd.fit(X_train, y_train)
+        sgd_pred = sgd.predict(X_test)
+        sgd_acc = accuracy_score(y_test, sgd_pred)
+    except Exception as e:
+        print("Error training SGDClassifier:", e)
+        sgd = None
+        sgd_acc = None
+
+    print("\nRandom Forest Test Accuracy (after optimization):", rf_acc)
+    print("Gradient Descent (SGDClassifier) Test Accuracy:", sgd_acc)
+
+    return rf_best, sgd, X_test, y_test, product_ids_test
+
+
+def show_recommendations(model, X_test, y_test, product_ids_test, model_name):
+    """
+    For the given model, obtains predicted probabilities for the positive class,
+    selects the top 10 products by probability, prints their ProductIDs,
+    and visualizes them in a bar chart.
+
+    Returns:
+    top_10_ids (ndarray): The top 10 ProductIDs based on predicted probability.
+    """
+    if model is None:
+        print(f"{model_name} model not available.")
+        return None
+
+    # Get predicted probabilities for class 1 (high demand)
+    probs = model.predict_proba(X_test)[:, 1]
+
+    # Sort test samples by descending probability and get top 10 indices
+    sorted_indices = np.argsort(probs)[::-1]
+    top_10_indices = sorted_indices[:10]
+
+    top_10_ids = product_ids_test[top_10_indices]
+    top_10_probs = probs[top_10_indices]
+
+    print(f"\nTop 10 Recommended Products to Sell (by Product ID) using {model_name}:")
+    for pid in top_10_ids:
+        print(pid)
+
+    # Bar chart visualization for top 10 recommendations
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(top_10_ids)), top_10_probs, tick_label=top_10_ids, color='skyblue')
+    plt.xlabel("Product ID")
+    plt.ylabel("Predicted Probability")
+    plt.title(f"Top 10 Recommendations by {model_name}")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    return top_10_ids
+
+
+def show_top10_demand_graph(data, top_10_ids):
+    """
+    Visualizes the overall demand for only the top 10 recommended products.
+    The x-axis shows Product IDs and the y-axis shows units sold.
+    """
+    # Filter the data for rows whose ProductID is in top_10_ids
+    top10_data = data[data['ProductID'].isin(top_10_ids)].copy()
+
+    # Order the rows according to the order in top_10_ids
+    top10_data = top10_data.set_index('ProductID').loc[top_10_ids].reset_index()
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(top10_data['ProductID'].astype(str), top10_data['units_sold'], color='skyblue')
+    plt.xlabel("Product ID")
+    plt.ylabel("Units Sold (Demand)")
+    plt.title("Demand vs Product (Top 10 Recommended Products)")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    filepath = "https://raw.githubusercontent.com/amankharwal/Website-data/master/summer-products-with-rating-and-performance_2020-08.csv"
+
+    # Load and preprocess the data
+    data, X, y, product_ids, product_names = load_and_process_data(filepath)
+
+    # Train both models and obtain test ProductIDs
+    rf, sgd, X_test, y_test, product_ids_test = train_models(X, y, product_ids)
+
+    # Get top 10 recommendations from Random Forest and Gradient Descent models
+    top10_ids_rf = show_recommendations(rf, X_test, y_test, product_ids_test, "Random Forest")
+    top10_ids_sgd = show_recommendations(sgd, X_test, y_test, product_ids_test, "Gradient Descent")
+
+    # For demand graph, we show only the top 10 recommended products (using, e.g., Random Forest recommendations)
+    if top10_ids_rf is not None:
+        show_top10_demand_graph(data, top10_ids_rf)
