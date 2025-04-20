@@ -211,3 +211,172 @@ if __name__ == "__main__":
     # For demand graph, we show only the top 10 recommended products (using, e.g., Random Forest recommendations)
     if top10_ids_rf is not None:
         show_top10_demand_graph(data, top10_ids_rf)
+
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import cross_val_score
+import numpy as np
+from skopt import BayesSearchCV
+
+# Load the data
+data = pd.read_csv('https://raw.githubusercontent.com/amankharwal/Website-data/master/summer-products-with-rating-and-performance_2020-08.csv')
+def load_and_preprocess(data):
+  # Data preprocessing
+      # Fill missing values
+      for col in data.columns:
+          if data[col].isnull().any():
+              if data[col].dtype == 'object':
+                  data[col] = data[col].fillna(data[col].mode()[0])  # Fill with mode for categorical
+              else:
+                  data[col] = data[col].fillna(data[col].mean())  # Fill with mean for numerical
+      # Store categorical data before encoding
+      categorical_data = {}
+      label_encoders = {}  # Store LabelEncoder instances
+      for col in data.select_dtypes(include=['object']):
+          categorical_data[col] = data[col].copy()
+          # Handle categorical features using Label Encoding
+          le = LabelEncoder()
+          data[col] = le.fit_transform(data[col])
+          label_encoders[col] = le # Store the encoder
+
+      # Convert 'rating' to discrete integer values if it's not already
+      if not np.issubdtype(data['rating'].dtype, np.integer):
+          data['rating'] = data['rating'].round().astype(int)
+
+      # Define features (X) and target (y)
+      X = data.drop('rating', axis=1)  # Features (excluding the target variable 'rating')
+      y = data['rating']  # Target variable ('rating')
+      return X,y, data, categorical_data, label_encoders
+
+def split(X,y):
+  # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Scale the data
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    return X_train, X_test, y_train, y_test, scaler
+
+def rf_train(X_train, y_train):
+    # Initialize and train the Random Forest Classifier
+    rf_classifier = RandomForestClassifier(n_estimators=100, random_state=42)  # You can adjust hyperparameters as needed
+    rf_classifier.fit(X_train, y_train)
+    return rf_classifier
+
+def sgd_train(X_train,y_train):
+    # Initialize and train the SGD Classifier
+    sgd_classifier = SGDClassifier(random_state=42)
+    sgd_classifier.fit(X_train, y_train)
+    return sgd_classifier
+
+def acc(X_test,y_test,rf_classifier,sgd_classifier):
+    # Make predictions on the test set
+    y_pred = rf_classifier.predict(X_test)
+    y_pred_sgd = sgd_classifier.predict(X_test)
+
+    # Evaluate the models
+    accuracy_rf = accuracy_score(y_test, y_pred)
+    accuracy_sgd = accuracy_score(y_test, y_pred_sgd)
+
+    print(f"Random Forest Accuracy: {accuracy_rf}")
+    print(f"SGD Classifier Accuracy: {accuracy_sgd}")
+    if(accuracy_rf>accuracy_sgd):
+      return rf_classifier
+    else:
+      return sgd_classifier
+
+def opt(model,X_train, y_train,X_test,y_test):
+      param_space = {
+          'n_estimators': (10, 200),
+          'max_depth': (2, 20),
+          'min_samples_split': (2, 20),
+          'min_samples_leaf': (1, 20),
+          'max_features': ['sqrt', 'log2', None]
+      }
+
+      opt = BayesSearchCV(
+            model,
+            param_space,
+            n_iter=6,  # Number of parameter settings sampled
+            cv=3,       # 3-fold cross-validation
+            n_jobs=-1,  # Use all available cores
+            random_state=42,
+            scoring='accuracy'
+            )
+      opt.fit(X_train, y_train)
+
+      # Best estimator after optimization
+      rf_best = opt.best_estimator_
+
+      cv_scores = cross_val_score(rf_best, X_train, y_train, cv=3, scoring='accuracy')
+      print("CV Accuracies:", cv_scores)
+      print("Mean CV Accuracy:", cv_scores.mean())
+      print("Std CV Accuracy:", cv_scores.std())
+
+      # Predict on test set and evaluate
+      rf_pred = rf_best.predict(X_test)
+      rf_acc = accuracy_score(y_test, rf_pred)
+      print(rf_acc)
+      return rf_best
+
+def predict_top_sold_items(data, model, scaler, label_encoders, top_n=10):
+    """
+    Predicts the top sold items and shows product ID and predicted probability using Matplotlib.
+
+    Args:
+        data (pd.DataFrame): The original dataframe.
+        rf_classifier: Trained Random Forest Classifier.
+        scaler: Fitted StandardScaler.
+        label_encoders (dict): Dictionary containing LabelEncoder instances.
+        top_n (int): Number of top items to retrieve.
+
+    Returns:
+        None: Displays a Matplotlib bar chart.
+    """
+    X_all = data.drop('rating', axis=1)
+    X_all_scaled = scaler.transform(X_all)
+    predicted_probabilities = model.predict_proba(X_all_scaled)
+    predicted_ratings = model.predict(X_all_scaled)
+
+    data['predicted_rating'] = predicted_ratings
+    data['predicted_probability'] = [max(prob) for prob in predicted_probabilities]  # Get max probability
+
+    top_items = data.sort_values('predicted_rating', ascending=False)
+    top_items = top_items.head(top_n)
+
+    le = label_encoders['product_id']
+    top_ids_decoded = le.inverse_transform(top_items['product_id']).tolist()
+    top_probabilities = top_items['predicted_probability'].tolist()
+    return top_ids_decoded,top_probabilities
+
+
+def show_top_item(top_ids_decoded, top_probabilities):
+    # Create the bar chart
+    plt.figure(figsize=(12, 6))
+    plt.bar(top_ids_decoded, top_probabilities, color='skyblue')
+    plt.xlabel('Product ID')
+    plt.ylabel('Predicted Probability')
+    plt.title('Top Sold Items: Product ID vs. Predicted Probability')
+    plt.xticks(rotation=45, ha='right')  # Rotate product IDs for better readability
+    plt.tight_layout()  # Adjust layout to prevent labels from overlapping
+    plt.show()
+
+
+if __name__=='__main__':
+  X,y, data, categorical_data, label_encoders=load_and_preprocess(data)
+  X_train, X_test, y_train, y_test, scaler=split(X,y)
+  rf_classifier=rf_train(X_train, y_train)
+  sgd_classifier=sgd_train(X_train,y_train)
+  model=acc(X_test,y_test,rf_classifier,sgd_classifier)
+  model=opt(model,X_train,y_train,X_test,y_test)
+  top_ids_decoded,top_probabilities=predict_top_sold_items(data.copy(), model, scaler, label_encoders)
+  show_top_item(top_ids_decoded, top_probabilities)
